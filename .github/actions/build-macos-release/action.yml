@@ -21,7 +21,7 @@ runs:
         DEVELOPER_DIR: /Applications/Xcode-latest.app
         MACOSX_DEPLOYMENT_TARGET: ${{ inputs.macos-target }}
       run: |
-        pip install build
+        uv pip install build
         python setup.py clean --all
         MLX_BUILD_STAGE=1 python -m build -w
 
