@@ -5,6 +5,7 @@
 
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/gpu/slicing.h"
+#include "mlx/backend/metal/binary.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/kernels.h"
 #include "mlx/backend/metal/kernels/defines.h"
@@ -29,6 +30,20 @@ ensure_row_contiguous(const array& x, metal::Device& d, const Stream& s) {
   metal::get_command_encoder(s).add_temporary(result);
   return result;
 }
+
+void conv_2D_gpu(
+    const Stream& s,
+    metal::Device& d,
+    const array& in,
+    const array& wt,
+    array& out,
+    const std::vector<int>& padding,
+    const std::vector<int>& wt_strides,
+    const std::vector<int>& wt_dilation,
+    const std::vector<int>& in_dilation,
+    const int groups,
+    bool flip,
+    std::vector<array>& copies);
 
 template <int N>
 void explicit_gemm_conv_ND_gpu(
@@ -676,6 +691,69 @@ void pad_and_slice_conv_3D_gpu(
       intermediate, intermediate.strides(), {0}, intermediate.data_size());
 }
 
+void small_kd_conv_3D_gpu(
+    const Stream& s,
+    metal::Device& d,
+    const array& in,
+    const array& wt,
+    array& out,
+    const MLXConvParams<3>& conv_params,
+    std::vector<array>& copies) {
+  const int H = conv_params.iS[1];
+  const int W = conv_params.iS[2];
+  const int C = conv_params.C;
+  const int O = conv_params.O;
+  const int KD = conv_params.wS[0];
+  const int KH = conv_params.wS[1];
+  const int KW = conv_params.wS[2];
+  const int OD = conv_params.oS[0];
+  const int OH = conv_params.oS[1];
+  const int OW = conv_params.oS[2];
+
+  for (int kd = 0; kd < KD; ++kd) {
+    array in_2d({OD, H, W, C}, in.dtype(), nullptr, {});
+    in_2d.copy_shared_buffer(
+        in,
+        {static_cast<int64_t>(H) * W * C, static_cast<int64_t>(W) * C, C, 1},
+        {true, true, false},
+        static_cast<size_t>(OD) * H * W * C,
+        static_cast<int64_t>(kd) * H * W * C);
+
+    array wt_2d({O, KH, KW, C}, wt.dtype(), nullptr, {});
+    wt_2d.copy_shared_buffer(
+        wt,
+        {static_cast<int64_t>(KD) * KH * KW * C,
+         static_cast<int64_t>(KW) * C,
+         C,
+         1},
+        {false, false, false},
+        static_cast<size_t>(O - 1) * KD * KH * KW * C +
+            static_cast<size_t>(KH) * KW * C,
+        static_cast<int64_t>(kd) * KH * KW * C);
+
+    array conv_out({OD, OH, OW, O}, out.dtype(), nullptr, {});
+    conv_2D_gpu(
+        s,
+        d,
+        in_2d,
+        wt_2d,
+        conv_out,
+        {conv_params.pad[1], conv_params.pad[2]},
+        {conv_params.str[1], conv_params.str[2]},
+        {conv_params.kdil[1], conv_params.kdil[2]},
+        {conv_params.idil[1], conv_params.idil[2]},
+        1,
+        conv_params.flip,
+        copies);
+    if (kd == 0) {
+      out = conv_out;
+    } else {
+      binary_op_gpu_inplace({out, conv_out}, out, "Add", s);
+      copies.push_back(conv_out);
+    }
+  }
+}
+
 void dispatch_conv_3D_gpu(
     const Stream& s,
     metal::Device& d,
@@ -707,6 +785,12 @@ void dispatch_conv_3D_gpu(
   auto wt = ensure_row_contiguous(wt_pre, d, s);
 
   // Perform the implicit gemm
+  if (conv_params.N == 1 && is_idil_one && mod16_channels &&
+      conv_params.groups == 1 && conv_params.wS[0] <= 5 &&
+      conv_params.str[0] == 1 && conv_params.kdil[0] == 1) {
+    return small_kd_conv_3D_gpu(s, d, in, wt, out, conv_params, copies);
+  }
+
   if (is_idil_one && mod16_channels) {
     return implicit_gemm_conv_3D_gpu(s, d, in, wt, out, conv_params);
   }
